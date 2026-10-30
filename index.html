@@ -1,0 +1,634 @@
+# ============================================================
+# CivicPulse - From Complaints to Action (SINGLE FILE VERSION)
+# Paste into Notepad, save as app.py, then run:
+#     pip install streamlit pandas folium streamlit-folium numpy
+#     streamlit run app.py
+# ============================================================
+import os
+import re
+import math
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import folium
+from streamlit_folium import st_folium
+
+
+# ==================== AI ENGINE (civic_ai) ====================
+
+
+# ----------------------------------------------------------------------
+# 1. CATEGORIZATION (keyword-weighted classifier + user hint)
+# ----------------------------------------------------------------------
+CATEGORIES = {
+    "Waterlogging": {
+        "waterlog": 3, "waterlogging": 3, "flooded": 3, "flood": 2,
+        "stagnant": 2, "puddle": 2, "rainwater": 2, "drain water": 2,
+        "sewage overflow": 2, "water logged": 3,
+    },
+    "Road Damage": {
+        "pothole": 3, "potholes": 3, "crack": 2, "cracks": 2, "broken road": 3,
+        "asphalt": 1, "speed breaker": 2, "road cave": 3, "uneven road": 2,
+        "road damage": 3, "paved": 1,
+    },
+    "Waste / Garbage": {
+        "garbage": 3, "trash": 3, "waste": 2, "dustbin": 3, "bin overflow": 3,
+        "dump": 2, "dumping": 2, "litter": 2, "debris": 2, "overflowing bin": 3,
+        "rotting": 2, "stink": 2,
+    },
+    "Streetlight": {
+        "streetlight": 3, "street light": 3, "lamp post": 3, "pole light": 3,
+        "no light": 3, "dark street": 3, "flickering light": 2, "light pole": 2,
+    },
+    "Water Supply": {
+        "no water": 3, "water supply": 3, "low pressure": 2, "pipe burst": 3,
+        "leaking pipe": 3, "brown water": 2, "contaminated water": 3,
+        "dry tap": 3, "water tanker": 1, "pipeline": 2,
+    },
+    "Public Safety": {
+        "live wire": 3, "open wire": 3, "electric shock": 3, "transformer": 2,
+        "fallen tree": 3, "accident prone": 3, "open drain": 2, "drowning": 3,
+        "fire hazard": 3, "broken railing": 2, "unsafe": 2,
+    },
+}
+USER_HINT_BONUS = 2.5  # if user picked a category manually, trust it a bit
+
+
+def _tokens(text):
+    return set(re.findall(r"[a-z0-9']+", text.lower()))
+
+
+def categorize(text, user_hint=None):
+    """Return (category, confidence, top_reasons). Keyword-weighted scoring."""
+    t = text.lower()
+    best, best_score = "Other", 0.0
+    scores = {}
+    for cat, kw in CATEGORIES.items():
+        s = 0.0
+        hits = []
+        for k, w in kw.items():
+            if k in t:
+                s += w
+                hits.append(k)
+        if user_hint == cat:
+            s += USER_HINT_BONUS
+        scores[cat] = s
+        if s > best_score:
+            best, best_score = cat, s
+    conf = round(min(best_score / 6.0, 1.0), 2) if best_score else 0.0
+    reasons = [f"matched keywords: {', '.join(sorted(k for k in CATEGORIES.get(best, {}) if k in t))[:80]}"] if best != "Other" else ["no strong keyword match"]
+    if user_hint == best:
+        reasons.append("agrees with the category you selected")
+    return best, conf, reasons
+
+
+# ----------------------------------------------------------------------
+# 2. SUMMARIZATION (extractive — first key sentence + location)
+# ----------------------------------------------------------------------
+def summarize(text, category, location):
+    """Extractive summary: most informative sentence, trimmed to ~150 chars."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    if not sentences:
+        return f"{category} issue reported near {location}."
+    # score sentences: prefer ones with severity keywords and early position
+    hot = ("urgent", "danger", "injur", "child", "night", "accident", "blocked", "overflow", "broken", "leak", "live wire", "dangling", "burst", "dead", "no water")
+    best, bs = sentences[0], -1
+    for i, s in enumerate(sentences[:4]):
+        sc = sum(1 for w in hot if w in s.lower()) * 2 - i
+        if sc > bs:
+            best, bs = s, sc
+    summary = best[:157] + ("..." if len(best) > 157 else "")
+    return f"[{category}] {summary} (near {location})"
+
+
+# ----------------------------------------------------------------------
+# 3. DUPLICATE DETECTION (TF-IDF cosine + geographic proximity)
+# ----------------------------------------------------------------------
+def _tfidf_matrix(texts):
+    """Tiny hand-rolled TF-IDF -> (matrix, vocab). No sklearn needed."""
+    docs = [re.findall(r"[a-z0-9']+", t.lower()) for t in texts]
+    df = {}
+    for d in docs:
+        for w in set(d):
+            df[w] = df.get(w, 0) + 1
+    N = len(docs)
+    idf = {w: math.log((N + 1) / (c + 1)) + 1 for w, c in df.items()}
+    vocab = sorted(idf)
+    idx = {w: i for i, w in enumerate(vocab)}
+    M = np.zeros((N, len(vocab)))
+    for r, d in enumerate(docs):
+        for w in d:
+            M[r, idx[w]] += 1.0
+        if M[r].sum():
+            M[r] /= M[r].sum()
+    M *= np.array([idf[w] for w in vocab])
+    norms = np.linalg.norm(M, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return M / norms
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def find_duplicates(df, text_sim=0.45, max_dist_m=250.0):
+    """Union-find: reports that are textually AND geographically near are one issue.
+    Returns (parent_map, group_map)."""
+    texts = (df["text"].astype(str) + " " + df["location"].astype(str)).tolist()
+    M = _tfidf_matrix(texts) if len(df) else np.zeros((0, 0))
+    parent = list(range(len(df)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i in range(len(df)):
+        for j in range(i + 1, len(df)):
+            sim = float(M[i] @ M[j])
+            dist = haversine_m(df.iloc[i].lat, df.iloc[i].lon, df.iloc[j].lat, df.iloc[j].lon)
+            if sim >= text_sim and dist <= max_dist_m:
+                union(i, j)
+
+    groups = {}
+    for i in range(len(df)):
+        groups.setdefault(find(i), []).append(i)
+    return parent, groups
+
+
+# ----------------------------------------------------------------------
+# 4. EXPLAINABLE PRIORITIZATION (additive scoring, every point has a reason)
+# ----------------------------------------------------------------------
+CAT_BASE = {"Public Safety": 40, "Waterlogging": 26, "Water Supply": 24,
+            "Road Damage": 22, "Streetlight": 18, "Waste / Garbage": 14, "Other": 10}
+SEVERITY = {
+    25: ["live wire", "electric shock", "fire hazard", "drowning", "injur",
+         "collapse", "child", "school", "hospital", "accident"],
+    15: ["night", "dark", "blocked", "overflow", "dengue", "malaria", "smell",
+         "rotting", "elderly", "no water", "fallen"],
+    8:  ["urgent", "danger", "unsafe", "heavy", "three days", "week"],
+}
+
+
+def score_priority(text, category, dup_count, age_days, in_hotspot):
+    """Returns (score 0-100, band, list_of_reason_strings)."""
+    t = text.lower()
+    score, reasons = 0.0, []
+    base = CAT_BASE.get(category, 10)
+    score += base
+    reasons.append(f"+{base} base weight for '{category}' category")
+    for pts, words in SEVERITY.items():
+        hits = [w for w in words if w in t]
+        if hits:
+            score += pts
+            reasons.append(f"+{pts} severity: mentions {', '.join(hits[:3])}")
+            break
+    if dup_count > 1:
+        pts = min((dup_count - 1) * 8, 24)
+        score += pts
+        reasons.append(f"+{pts} impact: {dup_count} reports describe the same issue")
+    if age_days <= 2:
+        score += 8
+        reasons.append("+8 fresh report (raised in last 48h)")
+    elif age_days <= 7:
+        score += 4
+        reasons.append("+4 recent report (within a week)")
+    else:
+        score -= 6
+        reasons.append("-6 stale report (>7 days old)")
+    if in_hotspot:
+        score += 10
+        reasons.append("+10 located inside a detected hotspot cluster")
+    score = int(round(max(0, min(100, score))))
+    band = ("Critical" if score >= 70 else "High" if score >= 50 else
+            "Medium" if score >= 32 else "Low")
+    return score, band, reasons
+
+
+# ----------------------------------------------------------------------
+# 5. HOTSPOT / CLUSTER DETECTION (greedy density clustering in meters)
+# ----------------------------------------------------------------------
+def find_hotspots(df, radius_m=350.0, min_reports=2):
+    """Greedy geo-cluster; a cluster with >=min_reports becomes a hotspot."""
+    pts = df[["lat", "lon"]].values
+    used = np.zeros(len(pts), bool)
+    clusters = []
+    for i in range(len(pts)):
+        if used[i]:
+            continue
+        d = np.array([haversine_m(pts[i][0], pts[i][1], p[0], p[1]) for p in pts])
+        members = np.where((d <= radius_m) & (~used))[0]
+        if len(members) >= min_reports:
+            used[members] = True
+            clusters.append(members.tolist())
+    return clusters
+
+
+def action_brief(cluster, df, now=None):
+    """Turn a cluster of reports into a <1-minute decision brief."""
+    sub = df.iloc[cluster]
+    cats = sub["category"].value_counts()
+    top_cat = cats.index[0]
+    n = len(sub)
+    center = (sub.lat.mean(), sub.lon.mean())
+    loc = sub["location"].mode().iloc[0] if not sub["location"].mode().empty else "the area"
+    days = int(max(1, (pd_max(sub.created_at) - pd_min(sub.created_at)).days) + 1) if n > 1 else 1
+    priority = sub["priority_score"].max()
+    brief = (f"**{top_cat} hotspot — {loc}.** {n} related reports within ~350m, "
+             f"spanning ~{days} day(s). Dominant issue: {top_cat.lower()} "
+             f"({cats.iloc[0]} of {n} reports"
+             + (f", co-occurring with {', '.join(cats.index[1:3])}" if len(cats) > 1 else "")
+             + f"). Highest priority in cluster: {int(priority)}/100. "
+             f"**Suggested action:** dispatch a joint crew to inspect {loc} "
+             f"({center[0]:.5f}, {center[1]:.5f}) and fix root causes together rather than "
+             f"closing tickets one by one.")
+    return brief, top_cat, n, center
+
+
+def pd_max(s):  # tiny helpers so we don't import pandas here
+    return max(s)
+
+
+def pd_min(s):
+    return min(s)
+
+
+# ----------------------------------------------------------------------
+# 6. FULL PIPELINE over the whole dataset
+# ----------------------------------------------------------------------
+def run_pipeline(df, now=None):
+    """Enriches a reports dataframe with AI outputs. Returns enriched copy."""
+    now = now or datetime.now()
+    df = df.copy()
+    _, groups = find_duplicates(df)
+    dup_of = {}
+    dup_size = {}
+    for members in groups.values():
+        if len(members) > 1:
+            lead = members[0]
+            for m in members:
+                dup_of[m] = lead
+                dup_size[m] = len(members)
+    # hotspots on unresolved reports
+    open_mask = ~df["status"].isin(["Resolved"])
+    open_idx = df.index[open_mask]
+    clusters = find_hotspots(df.loc[open_idx])
+    hotspot_ids = set()
+    for c in clusters:
+        for local_i in c:
+            hotspot_ids.add(open_idx[local_i])
+
+    out = []
+    for pos, row in enumerate(df.itertuples()):
+        age = (now - row.created_at).total_seconds() / 86400.0
+        dup_count = dup_size.get(pos, 1)
+        score, band, reasons = score_priority(row.text, row.category, dup_count, age,
+                                              row.Index in hotspot_ids)
+        out.append({
+            "ai_category": row.category,
+            "summary": summarize(row.text, row.category, row.location),
+            "dup_group": dup_of.get(pos, pos),
+            "dup_count": dup_count,
+            "priority_score": score,
+            "priority_band": band,
+            "priority_reasons": " | ".join(reasons),
+            "in_hotspot": row.Index in hotspot_ids,
+        })
+    enrich = __import__("pandas").DataFrame(out, index=df.index)
+    df = __import__("pandas").concat([df, enrich], axis=1)
+
+    briefs = []
+    for c in clusters:
+        global_idx = [open_idx[i] for i in c]
+        brief, top_cat, n, center = action_brief(global_idx, df)
+        briefs.append({"brief": brief, "category": top_cat, "reports": n, "center": center})
+    return df, briefs
+
+# ==================== SEED DATA (data.py) ====================
+
+
+CITY = (22.7196, 75.8577)  # Indore, as sample city
+
+# (text, category, location_name, lat, lon, days_ago, status, assignee)
+BASE = [
+    # ---------- URGENT SAFETY ----------
+    ("Live electric wire dangling from a pole right outside Saraswati School gate. Children walk under it every morning. Someone will get a shock.", "Public Safety", "Saraswati School Gate", 22.7261, 75.8642, 0.2, "Submitted", ""),
+    ("Open transformer box near City Hospital entrance, cover is broken and wires are exposed. Very dangerous at night, no lighting.", "Public Safety", "City Hospital Entrance", 22.7103, 75.8765, 1.0, "In Progress", "Electric Dept - R. Verma"),
+    ("Fallen tree blocking half the road after last night's storm. Two-wheelers are swerving into the wrong lane, accident prone spot now.", "Public Safety", "Vijay Nagar Sq", 22.7510, 75.8840, 0.5, "Assigned", "Municipal Crew 4"),
+
+    # ---------- MG ROAD CLUSTER (waterlogging + road + lights) ----------
+    ("MG Road underpass is completely waterlogged after the rain. Water is knee deep and vehicles are getting stuck.", "Waterlogging", "MG Road Underpass", 22.7178, 75.8731, 0.3, "Submitted", ""),
+    ("Same underpass at MG Road again full of water. Bikes stalling in the water. Happens every single monsoon.", "Waterlogging", "MG Road Underpass", 22.7180, 75.8733, 1.4, "Submitted", ""),
+    ("Drain near MG Road underpass is choked with plastic, water has nowhere to go. Smell is terrible.", "Waterlogging", "MG Road Underpass", 22.7176, 75.8728, 2.0, "In Progress", "Drainage Dept"),
+    ("Potholes near MG Road underpass entrance are full of water, cannot see how deep they are. Cars hitting them hard.", "Road Damage", "MG Road Underpass", 22.7183, 75.8738, 0.8, "Submitted", ""),
+    ("Streetlights on MG Road underpass approach have been dead for 3 days. Dark plus waterlogged plus potholes - very unsafe at night.", "Streetlight", "MG Road Underpass", 22.7181, 75.8742, 3.0, "Assigned", "Electric Dept - S. Khan"),
+    ("Road surface broken on MG Road near the underpass, big cracks. Water collects in them.", "Road Damage", "MG Road Underpass", 22.7179, 75.8730, 5.0, "Submitted", ""),
+
+    # ---------- DUPLICATE GROUP: palace road pothole ----------
+    ("Huge pothole on Palace Road near the bus stop, destroyed my bike's rim this morning.", "Road Damage", "Palace Road Bus Stop", 22.7055, 75.8580, 0.6, "Submitted", ""),
+    ("Palace road bus stop wala pothole is getting bigger, another auto got stuck today.", "Road Damage", "Palace Road Bus Stop", 22.7056, 75.8582, 1.2, "Submitted", ""),
+    ("Pothole near bus stop on Palace Road - deep crater in the left lane, please fix urgently.", "Road Damage", "Palace Road Bus Stop", 22.7054, 75.8578, 2.3, "Under Review", ""),
+
+    # ---------- WASTE ----------
+    ("Garbage bin on Rajwada Chowk overflowing for 4 days, stray dogs scattering trash everywhere, smell unbearable.", "Waste / Garbage", "Rajwada Chowk", 22.7177, 75.8547, 4.0, "In Progress", "Sanitation Zone 2"),
+    ("Someone is dumping construction debris on the footpath near Residency Area every night.", "Waste / Garbage", "Residency Area", 22.6990, 75.8420, 6.0, "Submitted", ""),
+    ("Trash not collected from our lane in Khajrana for a week, bins are overflowing and rotting.", "Waste / Garbage", "Khajrana Main Rd", 22.7315, 75.8970, 7.0, "Submitted", ""),
+    ("Overflowing dustbin outside the community park in Saket Nagar, flies everywhere, children play nearby.", "Waste / Garbage", "Saket Nagar Park", 22.7250, 75.8350, 1.5, "Under Review", ""),
+    ("Illegal garbage dumping at the empty plot on Ring Road, it is becoming a permanent dump site.", "Waste / Garbage", "Ring Road Empty Plot", 22.7420, 75.8950, 3.5, "Assigned", "Sanitation Zone 1"),
+    ("Market waste lying on MTH Road since Sunday, rotting vegetable smell across the whole street.", "Waste / Garbage", "MTH Road Market", 22.7080, 75.8800, 2.5, "Submitted", ""),
+
+    # ---------- STREETLIGHT ----------
+    ("Streetlight outside house 42 in Anand Nagar has been flickering then dead for a week. Street fully dark at night, unsafe for women returning late.", "Streetlight", "Anand Nagar Lane 3", 22.7380, 75.8650, 7.0, "Assigned", "Electric Dept - S. Khan"),
+    ("Three lamp posts dark on Sapna Sangeeta Road stretch near the temple. Very dark at 8pm.", "Streetlight", "Sapna Sangeeta Rd", 22.7220, 75.8820, 1.0, "Submitted", ""),
+    ("Park lights in Gandhi Hall garden not working, joggers using phone torches in the morning.", "Streetlight", "Gandhi Hall Garden", 22.7000, 75.8600, 2.0, "In Progress", "Parks Dept"),
+    ("Light pole bent after truck hit it last month near Bombay Hospital crossing, still not replaced.", "Streetlight", "Bombay Hospital Xing", 22.7150, 75.8620, 12.0, "Under Review", ""),
+    ("No streetlight working on the service road behind Radisson for months, becomes very unsafe at night.", "Streetlight", "Radisson Service Rd", 22.7305, 75.8825, 20.0, "Submitted", ""),
+
+    # ---------- WATERLOGGING elsewhere ----------
+    ("Water collects in front of our society gate on Kanchan Bagh road every rain, no proper drainage slope, elderly residents cannot cross.", "Waterlogging", "Kanchan Bagh Rd", 22.7058, 75.8460, 1.8, "Submitted", ""),
+    ("Street flooded near Bhawarkua square after just one hour of rain. Shops are getting water inside.", "Waterlogging", "Bhawarkua Square", 22.6975, 75.8685, 0.4, "Submitted", ""),
+    ("Low lying lane in Sudama Nagar stays flooded 2 days after every rain, kids wade through dirty water, dengue risk.", "Waterlogging", "Sudama Nagar Lane 5", 22.6920, 75.8410, 9.0, "In Progress", "Drainage Dept"),
+
+    # ---------- ROAD DAMAGE elsewhere ----------
+    ("Speed breaker on Rau Circle has broken apart, sharp metal rods sticking out, vehicles swerving dangerously.", "Road Damage", "Rau Circle", 22.7368, 75.8060, 0.9, "Submitted", ""),
+    ("Road dug up by telecom company on AB Road near C21 mall 3 months ago, never repaved, huge bump and dust.", "Road Damage", "AB Road C21 Mall", 22.7480, 75.8940, 15.0, "Assigned", "Roads Dept"),
+    ("Cracked pavement slabs outside railway station main gate, luggage wheels getting stuck, senior citizens tripping.", "Road Damage", "Railway Station Gate", 22.7170, 75.8680, 5.5, "Under Review", ""),
+    ("Entire stretch of Bada Ganpati road is crumbling, dozens of small potholes merging into one broken surface.", "Road Damage", "Bada Ganpati Rd", 22.7090, 75.8510, 8.0, "Submitted", ""),
+
+    # ---------- WATER SUPPLY ----------
+    ("No water supply in Rajendra Nagar sector B for 2 days straight. Tanker mafia charging double. Please help, families suffering.", "Water Supply", "Rajendra Nagar Sec B", 22.7455, 75.8695, 0.7, "Submitted", ""),
+    ("Water coming brown and muddy from taps in Nanda Nagar since Monday. Cannot drink or cook with it.", "Water Supply", "Nanda Nagar", 22.7240, 75.8470, 3.2, "In Progress", "Water Works"),
+    ("Main pipeline burst near Silicon City, water gushing onto road since morning, massive wastage.", "Water Supply", "Silicon City Main", 22.7580, 75.9280, 0.25, "Submitted", ""),
+    ("Low pressure on 3rd floor and above in Scheme No 78, cannot fill tanks after 8am.", "Water Supply", "Scheme 78", 22.7590, 75.9030, 11.0, "Submitted", ""),
+    ("Leaking public tap in Sarafa Bazaar running 24x7 for a week, water logging around it too.", "Water Supply", "Sarafa Bazaar", 22.7155, 75.8555, 6.5, "Under Review", ""),
+
+    # ---------- MORE MIX (keeps queue realistic) ----------
+    ("Stray cattle sitting in the middle of Kalani Nagar road causing traffic jam every evening.", "Other", "Kalani Nagar", 22.7200, 75.9110, 4.5, "Submitted", ""),
+    ("Public toilet near Krishnapura Chhatri is locked for weeks, no alternative nearby.", "Other", "Krishnapura Chhatri", 22.7140, 75.8520, 13.0, "Under Review", ""),
+    ("Footpath vendors blocking entire pavement near Tilak Nagar market, pedestrians forced onto road.", "Other", "Tilak Nagar Mkt", 22.7330, 75.8805, 2.2, "Assigned", "Encroachment Cell"),
+    ("Park swings broken in Sheetal Nagar park for months, children hurt themselves on rusted chains.", "Other", "Sheetal Nagar Park", 22.7400, 75.8525, 18.0, "Submitted", ""),
+    ("Water tanker leaking entire route on Aerodrome Road, road always wet and slippery now.", "Water Supply", "Aerodrome Rd", 22.7228, 75.8230, 1.1, "Submitted", ""),
+    ("Street dog pack aggressive near Palasia square school bus stop in morning hours.", "Other", "Palasia Square", 22.7215, 75.8695, 0.5, "Submitted", ""),
+    ("Pothole reopened after recent repair on Gita Bhawan road - patch came off in one week.", "Road Damage", "Gita Bhawan Rd", 22.7195, 75.8425, 2.8, "Submitted", ""),
+]
+
+
+def seed_dataframe(now=None):
+    now = now or datetime.now()
+    rows = []
+    for i, (text, cat, loc, lat, lon, d_ago, status, assignee) in enumerate(BASE, start=1):
+        rows.append({
+            "id": f"CP-{1000 + i}",
+            "text": text,
+            "image": "",
+            "category": cat,
+            "location": loc,
+            "lat": lat,
+            "lon": lon,
+            "status": status,
+            "assignee": assignee,
+            "created_at": now - timedelta(days=float(d_ago)),
+            "updated_at": now - timedelta(days=float(d_ago) * 0.5),
+        })
+    return pd.DataFrame(rows)
+
+
+STATUSES = ["Submitted", "Under Review", "Assigned", "In Progress", "Resolved"]
+
+if __name__ == "__main__":
+    df = seed_dataframe()
+    print(df.shape)
+    print(df["category"].value_counts())
+
+# ==================== STREAMLIT APP (app.py) ====================
+
+
+st.set_page_config(page_title="CivicPulse", page_icon="🏙️", layout="wide")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+CSV = os.path.join(DATA_DIR, "reports.csv")
+
+BAND_COLOR = {"Critical": "red", "High": "orange", "Medium": "beige", "Low": "green"}
+BAND_HEX = {"Critical": "#d62728", "High": "#ff7f0e", "Medium": "#bcbd22", "Low": "#2ca02c"}
+
+
+# ---------------- persistence ----------------
+def load_reports():
+    if not os.path.exists(CSV):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        seed_dataframe().to_csv(CSV, index=False)
+    df = pd.read_csv(CSV, parse_dates=["created_at", "updated_at"])
+    return df
+
+
+def save_reports(df):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    df.to_csv(CSV, index=False)
+
+
+@st.cache_data(show_spinner=False)
+def pipeline(df_csv):
+    df = pd.read_csv(df_csv, parse_dates=["created_at", "updated_at"])
+    enriched, briefs = civic_ai.run_pipeline(df)
+    return enriched, briefs
+
+
+if "refresh" not in st.session_state:
+    st.session_state.refresh = 0
+df = load_reports()
+# persist to a temp copy for the cache key
+_tmp = os.path.join(DATA_DIR, "_pipe_input.csv")
+df.to_csv(_tmp, index=False)
+enriched, briefs = pipeline(_tmp)
+enriched = enriched.sort_values(["priority_score"], ascending=False)
+
+st.title("🏙️ CivicPulse — From Complaints to Action")
+st.caption("AI-assisted civic issue reporting · prototype (local rule-based AI, no external APIs)")
+
+tab_report, tab_dash, tab_ai, tab_work, tab_track = st.tabs(
+    ["📝 Report a Problem", "🗺️ Dashboard", "🧠 AI Insights", "🔄 Workflow", "🔎 Track My Report"])
+
+# =================== TAB 1: REPORT ===================
+with tab_report:
+    st.subheader("Report a civic problem in under a minute")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        with st.form("report_form"):
+            text = st.text_area("Describe the problem*", placeholder="e.g. Streetlight dead outside our lane, street is pitch dark at night…")
+            cat_hint = st.selectbox("Category", ["Auto (let AI decide)"] + list(civic_ai.CATEGORIES) + ["Other"])
+            img = st.file_uploader("Photo (optional)", type=["jpg", "jpeg", "png"])
+            loc_name = st.text_input("Location name*", placeholder="e.g. MG Road Underpass")
+            lat_in = st.number_input("Latitude", value=CITY[0], format="%.5f")
+            lon_in = st.number_input("Longitude", value=CITY[1], format="%.5f")
+            submitted = st.form_submit_button("🚀 Submit Report", use_container_width=True)
+    with c2:
+        st.markdown("**Tap the map to drop your pin:**")
+        m = folium.Map(location=[lat_in, lon_in], zoom_start=14)
+        folium.Marker([lat_in, lon_in], tooltip="Report location").add_to(m)
+        map_out = st_folium(m, height=320, key="pick")
+        if map_out and map_out.get("last_clicked"):
+            st.info(f"Pin set: {map_out['last_clicked']['lat']:.5f}, {map_out['last_clicked']['lng']:.5f} — copy into the fields on the left.")
+
+    if submitted:
+        if not text.strip() or not loc_name.strip():
+            st.error("Please add a description and a location name.")
+        else:
+            now = datetime.now()
+            hint = None if cat_hint.startswith("Auto") else cat_hint
+            ai_cat, conf, cat_reasons = civic_ai.categorize(text, hint)
+            # duplicate check against everything we already have
+            probe = df.copy()
+            new_row = {"text": text, "location": loc_name, "lat": lat_in, "lon": lon_in}
+            probe = pd.concat([probe, pd.DataFrame([new_row])], ignore_index=True)
+            _, groups = civic_ai.find_duplicates(probe)
+            dups = [g for g in groups.values() if len(probe) - 1 in g and len(g) > 1]
+            dup_ids = [probe.iloc[i]["id"] for g in dups for i in g if i < len(df)] if len(df) else []
+            dup_n = (len(dups[0]) if dups else 1)
+
+            new_id = f"CP-{1000 + len(df) + 1}"
+            summary = civic_ai.summarize(text, ai_cat, loc_name)
+            score, band, reasons = civic_ai.score_priority(
+                text, ai_cat, dup_n, age_days=0, in_hotspot=False)
+            row = {
+                "id": new_id, "text": text, "image": img.name if img else "",
+                "category": ai_cat, "location": loc_name, "lat": lat_in, "lon": lon_in,
+                "status": "Submitted", "assignee": "", "created_at": now, "updated_at": now,
+            }
+            df2 = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            save_reports(df2)
+            st.session_state.refresh += 1
+            st.cache_data.clear()
+
+            st.success(f"Report {new_id} submitted and processed by the AI pipeline.")
+            e1, e2, e3 = st.columns(3)
+            e1.metric("AI Category", f"{ai_cat} ({conf:.0%})")
+            e2.metric("Priority", f"{band} · {score}/100")
+            e3.metric("Duplicate check", f"{len(dup_ids)} similar open report(s)" if dup_ids else "No duplicates found")
+            st.markdown(f"**AI summary:** {summary}")
+            if dup_ids:
+                st.warning(f"⚠️ This looks like the same issue as: {', '.join(map(str, dup_ids))}. "
+                           "It has been linked and will raise the combined priority.")
+            with st.expander("Why this priority? (explainable AI)"):
+                for r in reasons:
+                    st.markdown(f"- {r}")
+            with st.expander("Why this category?"):
+                for r in cat_reasons:
+                    st.markdown(f"- {r}")
+            st.balloons()
+
+# =================== TAB 2: DASHBOARD ===================
+with tab_dash:
+    f1, f2, f3 = st.columns(3)
+    open_df = enriched[enriched.status != "Resolved"]
+    f1.metric("Open reports", len(open_df))
+    f2.metric("Critical / High now", int((open_df.priority_band.isin(["Critical", "High"])).sum()))
+    f3.metric("Hotspots detected", len(briefs))
+
+    b1, b2 = st.columns([2, 1])
+    with b1:
+        m = folium.Map(location=CITY, zoom_start=13)
+        for _, r in enriched.iterrows():
+            color = BAND_COLOR.get(r.priority_band, "blue")
+            folium.CircleMarker(
+                [r.lat, r.lon], radius=7, color=color, fill=True, fill_color=color,
+                fill_opacity=0.8,
+                tooltip=f"{r.id} · {r.category} · {r.priority_band} ({int(r.priority_score)})",
+                popup=folium.Popup(
+                    f"<b>{r.id}</b> {r.category}<br>{r.location}<br>"
+                    f"Priority: {r.priority_band} ({int(r.priority_score)})<br>Status: {r.status}"
+                    f"<br><i>{r.summary}</i>", max_width=260),
+            ).add_to(m)
+        for b in briefs:  # hotspot rings
+            folium.Circle(b["center"], radius=350, color="purple", weight=3, fill=True,
+                          fill_opacity=0.08,
+                          tooltip=f"Hotspot: {b['category']} · {b['reports']} reports").add_to(m)
+        st_folium(m, height=480, key="dash")
+    with b2:
+        st.markdown("**Priority queue (top 10)**")
+        show = enriched[["id", "category", "location", "priority_band", "priority_score", "status"]].head(10)
+        st.dataframe(show, use_container_width=True, hide_index=True,
+                     column_config={"priority_score": st.column_config.ProgressColumn(
+                         "score", min_value=0, max_value=100)})
+        st.markdown("**By category**")
+        st.bar_chart(enriched["category"].value_counts())
+        st.markdown("**Status funnel**")
+        st.bar_chart(enriched["status"].value_counts())
+
+# =================== TAB 3: AI INSIGHTS ===================
+with tab_ai:
+    st.subheader("Action briefs — what to fix first, and why")
+    if not briefs:
+        st.info("No hotspots detected yet.")
+    for i, b in enumerate(briefs, 1):
+        st.markdown(f"**{i}.** {b['brief']}")
+        sub = enriched[(enriched.lat - b['center'][0]).abs() < 0.01]
+        st.caption(f"Cluster center: {b['center'][0]:.5f}, {b['center'][1]:.5f} · {b['reports']} reports")
+        st.divider()
+
+    st.subheader("Duplicate groups (same underlying issue)")
+    dup_df = enriched[enriched.dup_count > 1][["id", "location", "category", "dup_count", "status"]]
+    if dup_df.empty:
+        st.info("No duplicates found yet.")
+    else:
+        st.dataframe(dup_df, use_container_width=True, hide_index=True)
+        st.caption("TF-IDF text similarity (≥0.45) + proximity (≤250 m) → merged into one issue. "
+                   "Each extra report raises the priority of the whole group.")
+
+# =================== TAB 4: WORKFLOW ===================
+with tab_work:
+    st.subheader("Authority console — review, assign, advance")
+    st.dataframe(
+        enriched[["id", "category", "location", "priority_band", "priority_score", "status", "assignee", "created_at"]],
+        use_container_width=True, hide_index=True)
+    ids = enriched["id"].tolist()
+    sel = st.selectbox("Select report", ids)
+    row = enriched[enriched.id == sel].iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f"**{row.category}** — {row.location}")
+    c1.caption(row.summary)
+    with c2:
+        new_status = st.selectbox("Status", STATUSES, index=STATUSES.index(row.status))
+        assignee = st.text_input("Assign to (crew / officer)", value=row.assignee)
+    with c3:
+        st.markdown("**Why this rank?**")
+        for r in str(row.priority_reasons).split(" | "):
+            st.caption(r)
+        if st.button("✅ Update report", use_container_width=True):
+            dfx = load_reports()
+            dfx.loc[dfx.id == sel, ["status", "assignee", "updated_at"]] = [new_status, assignee, datetime.now()]
+            save_reports(dfx)
+            st.cache_data.clear()
+            st.success(f"{sel} → {new_status}. Citizens tracking this ID will see the update.")
+            st.rerun()
+
+# =================== TAB 5: TRACK ===================
+with tab_track:
+    st.subheader("Citizen view — track your report")
+    rid = st.text_input("Enter your report ID", placeholder="e.g. CP-1004")
+    if rid:
+        hit = enriched[enriched.id.str.contains(rid, case=False, na=False)]
+        if hit.empty:
+            st.warning("No report found with that ID.")
+        else:
+            r = hit.iloc[0]
+            st.markdown(f"**{r.id}** — {r.category} at {r.location}")
+            st.progress(STATUSES.index(r.status) / (len(STATUSES) - 1), text=f"Status: {r.status}")
+            steps = " → ".join(f"**{s}**" if s == r.status else s for s in STATUSES)
+            st.markdown(steps)
+            st.markdown(f"- Submitted: {r.created_at:%d %b %Y, %H:%M}")
+            st.markdown(f"- Assignee: {r.assignee or 'not yet assigned'}")
+            st.markdown(f"- AI summary: {r.summary}")
+            with st.expander("Priority reasoning"):
+                for rr in str(r.priority_reasons).split(" | "):
+                    st.markdown(f"- {rr}")
